@@ -47,7 +47,7 @@ def load_config():
     candidates = []
     if system_prompt_path:
         candidates.append(system_prompt_path)
-    candidates.append(os.path.join(os.getcwd(), "lipstick_qa_system_message (1).txt"))
+    candidates.append(os.path.join(os.getcwd(), "lipstick_qa_system_message.txt"))
 
     for path in candidates:
         if path and os.path.isfile(path):
@@ -60,7 +60,7 @@ def load_config():
                 print(f"[Warning] Failed to read prompt file '{path}': {e}")
 
     if system_prompt is None:
-        print("Error: No system prompt file found. Set SYSTEM_PROMPT_PATH to a valid file or place 'lipstick_qa_system_message (1).txt' in the project root.")
+        print("Error: No system prompt file found. Set SYSTEM_PROMPT_PATH to a valid file or place 'lipstick_qa_system_message.txt' in the project root.")
         sys.exit(1)
 
     max_tokens = int(os.getenv("ANTHROPIC_MAX_TOKENS", "2000"))
