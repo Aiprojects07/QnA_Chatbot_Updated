@@ -75,7 +75,7 @@ def load_config():
     pc_env = os.getenv("PINECONE_ENVIRONMENT")
     pc_index_name = os.getenv("PINECONE_INDEX_NAME")
     pc_namespace = os.getenv("PINECONE_NAMESPACE", "default")
-    pc_top_k = int(os.getenv("PINECONE_TOP_K", "1"))
+    pc_top_k = int(os.getenv("PINECONE_TOP_K", "3"))
 
     return {
         "api_key": api_key,
@@ -124,89 +124,113 @@ def embed_query(client: OpenAI, model: str, text: str) -> List[float]:
     return resp.data[0].embedding
 
 
-
-def query_mentions_previous(user_query: str, last_ref: dict) -> bool:
-    """Return True if the current query already mentions the last referenced product/brand/shade/SKU.
-    This avoids hardcoded brand lists by dynamically checking tokens from last_ref.
-    """
-    if not last_ref:
-        return False
-    lowered = user_query.lower()
-    candidate_tokens: list[str] = []
-    for key in ("Product", "Brand", "Shade", "SKU", "Product Name", "Product Line"):
-        v = last_ref.get(key) or last_ref.get(key.lower())
-        if not isinstance(v, str) or not v:
-            continue
-        # consider the full string and its word parts
-        candidate_tokens.append(v)
-        candidate_tokens.extend(v.replace("-", " ").split())
-    # keep tokens with reasonable length to reduce false positives
-    candidate_tokens = [t for t in candidate_tokens if isinstance(t, str) and len(t) >= 3]
-    for t in candidate_tokens:
-        if t.lower() in lowered:
-            return True
-    return False
-
-
-# ----------------------
-# Identity extraction from Pinecone metadata/content
-# ----------------------
-def parse_header_kv(text: str) -> dict:
-    """Parse header like "[ SKU=...; Brand=...; Product=...; Shade=...; Product Line=...]" from a content string."""
-    out: dict = {}
-    if not isinstance(text, str):
-        return out
-    # find bracketed header
-    start = text.find("[")
-    end = text.find("]", start + 1)
-    header = text[start + 1:end] if start != -1 and end != -1 else None
-    if not header:
-        return out
-    # split by ';'
-    parts = [p.strip() for p in header.split(";") if p.strip()]
-    for p in parts:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            if k and v:
-                out[k] = v
-                out[k.lower()] = v  # also store lowercase alias
-    return out
-
-
-def extract_identity_fields(md: dict) -> dict:
-    """Return a dict with canonical keys Product, Brand, Shade, SKU, Product Line, Product Name from metadata.
-    Handles lowercase variants and parses 'content' header if present.
-    """
-    ident: dict = {}
-    if not isinstance(md, dict):
-        return ident
-    # direct fields (any casing variants)
-    candidates = {
-        "Product": ["Product", "product", "product_name", "name"],
-        "Brand": ["Brand", "brand"],
-        "Shade": ["Shade", "shade", "shade_name"],
-        "SKU": ["SKU", "sku", "id", "product_id"],
-        "Product Line": ["Product Line", "product_line", "line"],
-        "Product Name": ["Product Name", "product_name"],
-    }
-    for canon, keys in candidates.items():
-        for k in keys:
-            if k in md and isinstance(md[k], str) and md[k].strip():
-                ident[canon] = md[k].strip()
-                break
-    # parse header in content for missing ones
-    header = parse_header_kv(md.get("content")) if "content" in md else {}
-    for canon in ("Product", "Brand", "Shade", "SKU", "Product Line", "Product Name"):
-        if canon not in ident:
-            v = header.get(canon) or header.get(canon.lower())
-            if isinstance(v, str) and v.strip():
-                ident[canon] = v.strip()
-    return ident
-
-
+def reformulate_query_with_llm(client: Anthropic, user_query: str, conv_history: List[Dict[str, str]], model: str = "claude-haiku-4-5-20251001") -> str:
+    """Use LLM to reformulate user query based on conversation history.
+    This replaces hardcoded pattern matching with intelligent context understanding.
     
+    Args:
+        client: Anthropic client
+        user_query: Current user query
+        conv_history: List of previous messages [{"role": "user"|"assistant", "content": str}]
+        model: Model to use for reformulation (default: fast Haiku model)
+    
+    Returns:
+        Reformulated query optimized for semantic search
+    """
+    # Take only the last 2-3 turns for context (avoid token bloat)
+    recent_history = conv_history[-(4):] if len(conv_history) > 4 else conv_history
+    
+    # Build conversation context string
+    context_lines = []
+    for msg in recent_history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user":
+            # Extract just the question part (remove "Question:" and "Context:" sections if present)
+            if "Question:" in content:
+                question_part = content.split("Question:")[1].split("Context:")[0].strip()
+                context_lines.append(f"User: {question_part}")
+            else:
+                context_lines.append(f"User: {content[:200]}")  # Limit length
+        elif role == "assistant":
+            context_lines.append(f"Assistant: {content[:200]}")  # Limit length
+    
+    conversation_context = "\n".join(context_lines) if context_lines else "[No previous conversation]"
+    
+    reformulation_prompt = f"""You are a query reformulation assistant for a product Q&A system.
+
+Your task: Check if the conversation history has enough information to answer the user's question. If yes, answer directly. If no, generate an optimized search query. If the question is ambiguous, ask for clarification.
+
+Rules:
+1. First check: Does the conversation history contain enough information to answer this question?
+   - If YES: Return the answer directly based on the history (prefix with "ANSWER: ")
+   - If NO: Continue to step 2
+
+2. Ambiguity check:
+   - If the user refers to "this lipstick", "this product", "it", "this", etc. WITHOUT naming a specific product:
+     * Check conversation history for [Retrieved: ...] markers with product context
+     * If NO clear product context exists in recent history: Return "CLARIFY: Could you please specify which lipstick you're asking about? (Include the brand and product name)"
+     * If product context exists but you're uncertain which product they mean: Return "CLARIFY: I see multiple products mentioned. Which one are you asking about - [list products]?"
+   - If the question is clear and specific, proceed to step 3
+
+3. For search query generation:
+   - IMPORTANT: Always include BOTH the product identifier AND the key question terms
+   - Example: "What is the shade of MAC Ruby Woo?" → "MAC Ruby Woo shade" (NOT just "MAC Ruby Woo")
+   - Example: "Does it last long?" → "[Product Name] longevity lasting" (NOT just "[Product Name]")
+   - Look for [Retrieved: ...] markers in history - they contain Product, Brand, and SKU from previous queries
+   - If the question is a follow-up (e.g., "what is the price?", "does it last long?"), include the product name AND the question attribute (price, longevity, etc.)
+   - SKU with the full product Name also is the most precise identifier 
+   - If the question mentions a NEW product name, use ONLY that new product (ignore previous context)
+   - Keep the query concise but include: product identifier + key question terms (shade, price, finish, longevity, ingredients, etc.)
+   - Remove filler words like "tell me", "I want to know", "what is", etc.
+   - Preserve important qualifiers like shade names/numbers, skin tone, skin concerns, etc.
+
+Conversation History:
+{conversation_context}
+
+Current Question: {user_query}
+
+Response (either "ANSWER: <answer>", "CLARIFY: <clarification question>", or "<search_query>"):"""
+    
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=300,  # Increased for direct answers from history
+            temperature=0.0,  # Deterministic
+            messages=[{"role": "user", "content": reformulation_prompt}]
+        )
+        
+        # Extract response
+        reformulated = ""
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                reformulated = getattr(block, "text", "").strip()
+                break
+        
+        if reformulated and len(reformulated) > 3:
+            # Check if LLM answered directly from history
+            if reformulated.startswith("ANSWER:"):
+                answer = reformulated[7:].strip()  # Remove "ANSWER: " prefix
+                logging.info("⚡ Answering from conversation history (no RAG needed)")
+                return f"ANSWER:{answer}"  # Return with marker for main loop
+            # Check if LLM needs clarification
+            elif reformulated.startswith("CLARIFY:"):
+                clarification = reformulated[8:].strip()  # Remove "CLARIFY: " prefix
+                logging.info("❓ Asking for clarification")
+                return f"CLARIFY:{clarification}"  # Return with marker for main loop
+            # Otherwise it's a search query
+            logging.info("🔄 Query reformulated: '%s' → '%s'", user_query, reformulated)
+            return reformulated
+        else:
+            logging.warning("LLM reformulation returned empty, using original query")
+            return user_query
+            
+    except Exception as e:
+        logging.warning("Query reformulation failed: %s, using original query", e)
+        return user_query
+
+
+
 
 def retrieve_context(index: Any, vector: List[float], namespace: str, top_k: int, metadata_filter: Dict[str, Any] = None) -> tuple:
     t0 = time.perf_counter()
@@ -354,9 +378,6 @@ def main():
     # Seed from persistent history
     conv_history: List[Dict[str, str]] = load_conv_history(conv_history_path, max_turns)
 
-    # Track last resolved product context from retrieval (for follow-up questions)
-    last_ref: Dict[str, Any] = {}
-
     try:
         while True:
             try:
@@ -378,95 +399,70 @@ def main():
             if oai and pc_index:
                 try:
                     t_emb0 = time.perf_counter()
-                    # If previous turn identified a product/shade and user didn't name it now, carry over
-                    metadata_filter = None
-                    effective_query = user_input
-                    
-                    # Check if we have previous product context
-                    prev_product = (last_ref.get("Product") or last_ref.get("product") or "").strip()
-                    prev_brand = (last_ref.get("Brand") or last_ref.get("brand") or "").strip()
-                    prev_shade = (last_ref.get("Shade") or last_ref.get("shade") or "").strip()
-                    prev_sku = (last_ref.get("SKU") or last_ref.get("sku") or "").strip()
-                    
-                    # Detect if user already mentioned the previous product context (dynamic, no hardcoding)
-                    mentions_product = query_mentions_previous(user_input, last_ref)
-                    
-                    # If we have previous context and user didn't mention product, augment query
-                    if (prev_product or prev_brand or prev_sku) and not mentions_product:
-                        # Augment the query with previous product context
-                        steer_bits = []
-                        # Prefer product; add brand only if not already part of product text
-                        if prev_product:
-                            steer_bits.append(prev_product)
-                            if prev_brand and prev_brand.lower() not in prev_product.lower():
-                                steer_bits.append(prev_brand)
-                        else:
-                            if prev_brand:
-                                steer_bits.append(prev_brand)
-                            if prev_shade:
-                                steer_bits.append(prev_shade)
-                        # Make unique while preserving order
-                        seen = set()
-                        steer_bits = [b for b in steer_bits if not (b in seen or seen.add(b))]
-                        
-                        if steer_bits:
-                            product_context = " ".join(steer_bits)
-                            # Prepend product context to query for better semantic search
-                            # Include SKU token in the text (helps embeddings) if available
-                            if prev_sku:
-                                effective_query = f"{product_context} [SKU: {prev_sku}] {user_input}"
-                            else:
-                                effective_query = f"{product_context} {user_input}"
-                            logger.info("🔗 Augmented query with previous product: '%s'", product_context)
-                            # No Pinecone filter — we rerank client-side by SKU
-                            metadata_filter = None
-                            logger.debug("Using client-side rerank by SKU (no metadata filter)")
+                    # Use LLM to reformulate query based on conversation history
+                    # This intelligently handles follow-up questions and new product queries
+                    effective_query = reformulate_query_with_llm(client, user_input, conv_history, cfg["model"])
 
+                    # Check if LLM answered directly from history
+                    if effective_query.startswith("ANSWER:"):
+                        # Extract the direct answer and skip RAG + main LLM
+                        direct_answer = effective_query[7:].strip()
+                        logger.info("⚡ Using direct answer from conversation history")
+                        render_assistant(direct_answer)
+                        # Save to history
+                        conv_history.append({"role": "user", "content": user_input})
+                        append_conv_history(conv_history_path, "user", user_input)
+                        conv_history.append({"role": "assistant", "content": direct_answer})
+                        append_conv_history(conv_history_path, "assistant", direct_answer)
+                        turn_t1 = time.perf_counter()
+                        logger.info("Turn total time: %.3fs (answered from history)", (turn_t1 - turn_t0))
+                        continue  # Skip to next user input
+                    
+                    # Check if LLM needs clarification
+                    if effective_query.startswith("CLARIFY:"):
+                        # Extract the clarification question and ask user
+                        clarification_msg = effective_query[8:].strip()
+                        logger.info("❓ Requesting clarification from user")
+                        render_assistant(clarification_msg)
+                        # Save to history
+                        conv_history.append({"role": "user", "content": user_input})
+                        append_conv_history(conv_history_path, "user", user_input)
+                        conv_history.append({"role": "assistant", "content": clarification_msg})
+                        append_conv_history(conv_history_path, "assistant", clarification_msg)
+                        turn_t1 = time.perf_counter()
+                        logger.info("Turn total time: %.3fs (asked for clarification)", (turn_t1 - turn_t0))
+                        continue  # Skip to next user input
+                    
+                    # Otherwise perform RAG retrieval
                     vec = embed_query(oai, cfg["embedding_model"], effective_query)
                     t_emb1 = time.perf_counter()
                     logger.info("Embedding time: %.3fs (model=%s, dim=%d)", (t_emb1 - t_emb0), cfg["embedding_model"], len(vec))
                     logger.debug("Embedded query into vector of length %d", len(vec))
                     matches, _ = retrieve_context(pc_index, vec, cfg["pc_namespace"], cfg["pc_top_k"], metadata_filter=None)
-                    # Optional: rerank matches to prioritize items with matching carried SKU
-                    if matches and last_ref.get("SKU"):
-                        prev_sku_val = last_ref.get("SKU")
-                        def sku_match_first(item):
-                            md_i = getattr(item, "metadata", None) or item.get("metadata", {})
-                            ident_i = extract_identity_fields(md_i)
-                            id_i = getattr(item, "id", None) or item.get("id")
-                            sku_equal = (ident_i.get("SKU") == prev_sku_val)
-                            id_contains = (isinstance(id_i, str) and prev_sku_val in id_i)
-                            # Primary key: 0 for positive match, 1 otherwise
-                            primary = 0 if (sku_equal or id_contains) else 1
-                            # Secondary: negative score for descending sort if available
-                            score = getattr(item, "score", None)
-                            if score is None and isinstance(item, dict):
-                                score = item.get("score")
-                            secondary = -(score or 0.0)
-                            return (primary, secondary)
-                        try:
-                            matches.sort(key=sku_match_first)
-                            logger.debug("Reranked matches to prioritize SKU/id match for SKU=%s", prev_sku_val)
-                        except Exception:
-                            pass
-
+                    
+                    # Extract SKU and product info from top match for context tracking
+                    retrieved_sku = None
+                    retrieved_product = None
+                    retrieved_brand = None
+                    if matches:
+                        top_match_md = getattr(matches[0], "metadata", None) or matches[0].get("metadata", {})
+                        # Try multiple field names for SKU
+                        retrieved_sku = (top_match_md.get("SKU") or top_match_md.get("sku") or 
+                                        top_match_md.get("id") or top_match_md.get("product_id") or "").strip()
+                        # Try multiple field names for product/brand
+                        retrieved_product = (top_match_md.get("Product") or top_match_md.get("product") or 
+                                           top_match_md.get("product_name") or top_match_md.get("name") or "").strip()
+                        retrieved_brand = (top_match_md.get("Brand") or top_match_md.get("brand") or "").strip()
+                        
+                        if retrieved_sku or retrieved_product:
+                            logger.info("📦 Retrieved product context - SKU: %s, Product: %s, Brand: %s", 
+                                      retrieved_sku or "N/A", retrieved_product or "N/A", retrieved_brand or "N/A")
+                    
                     for m in matches:
                         md = getattr(m, "metadata", None) or m.get("metadata", {})
                         txt = extract_text_from_metadata(md)
                         if txt:
                             context_blocks.append(txt)
-                    
-                    # Update last reference with best match's identity fields
-                    if matches:
-                        top_md = getattr(matches[0], "metadata", None) or matches[0].get("metadata", {})
-                        # Extract and store product details for next turn (robust to lowercase and header-in-content)
-                        ident = extract_identity_fields(top_md)
-                        if ident:
-                            last_ref.update(ident)
-                        # Log stored context (helpful for debugging)
-                        stored_info = {k: v for k, v in last_ref.items() if k in ("Product", "Brand", "Shade", "SKU")}
-                        if stored_info:
-                            logger.info("💾 Stored product context for next turn: %s", stored_info)
                             
                 except Exception as e:
                     logger.warning("RAG retrieval failed: %s", e)
@@ -483,11 +479,26 @@ def main():
                 "You are a precise assistant. Answer ONLY using the provided context. "
                 "If the answer isn't in the context, say 'I don't know' succinctly."
             )
+            # Build user payload with product metadata for context tracking
             question_block = f"Question:\n{user_input}"
+            
+            # Add SKU/product metadata to history for reformulation context
+            product_context_line = ""
+            if 'retrieved_sku' in locals() and (retrieved_sku or retrieved_product):
+                context_parts = []
+                if retrieved_product:
+                    context_parts.append(f"Product: {retrieved_product}")
+                if retrieved_brand:
+                    context_parts.append(f"Brand: {retrieved_brand}")
+                if retrieved_sku:
+                    context_parts.append(f"SKU: {retrieved_sku}")
+                if context_parts:
+                    product_context_line = f"\n[Retrieved: {', '.join(context_parts)}]"
+            
             if context_text:
-                user_payload = f"{question_block}\n\nContext:\n{context_text}"
+                user_payload = f"{question_block}{product_context_line}\n\nContext:\n{context_text}"
             else:
-                user_payload = f"{question_block}\n\nContext:\n[No relevant context retrieved]"
+                user_payload = f"{question_block}{product_context_line}\n\nContext:\n[No relevant context retrieved]"
 
             # Include conversation history window in messages
             history_window = conv_history[-(max_turns * 2):] if max_turns > 0 else []

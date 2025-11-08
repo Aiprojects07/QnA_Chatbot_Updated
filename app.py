@@ -11,10 +11,9 @@ from chatbot import (
     build_openai_client,
     build_pinecone,
     embed_query,
+    reformulate_query_with_llm,
     retrieve_context,
     extract_text_from_metadata,
-    extract_identity_fields,
-    query_mentions_previous,
     load_conv_history,
     append_conv_history,
 )
@@ -60,8 +59,7 @@ def init_state():
         st.session_state.pc_index = None
     if "conv_history" not in st.session_state:
         st.session_state.conv_history = []  # list of {role, content}
-    if "last_ref" not in st.session_state:
-        st.session_state.last_ref = {}
+    # Removed last_ref - no longer needed with LLM reformulation
     if "history_path" not in st.session_state:
         # Per-session JSONL history file (override via CONV_HISTORY_PATH if provided)
         base_path = os.environ.get("CONV_HISTORY_PATH")
@@ -96,64 +94,65 @@ def do_rag_and_respond(user_input: str) -> str:
 
     max_turns = int(os.getenv("HISTORY_MAX_TURNS", "5"))
 
-    # Build context via RAG similar to CLI flow
+    # Build context via RAG using new LLM reformulation approach
     context_blocks: List[str] = []
-    effective_query = user_input
+    
+    # Load conversation history for reformulation
+    conv_history_for_llm = load_conv_history(st.session_state.history_path, max_turns)
 
-    last_ref: Dict[str, Any] = st.session_state.last_ref
-    prev_product = (last_ref.get("Product") or last_ref.get("product") or "").strip()
-    prev_brand = (last_ref.get("Brand") or last_ref.get("brand") or "").strip()
-    prev_shade = (last_ref.get("Shade") or last_ref.get("shade") or "").strip()
-    prev_sku = (last_ref.get("SKU") or last_ref.get("sku") or "").strip()
-
-    mentions_product = query_mentions_previous(user_input, last_ref)
-
-    if (prev_product or prev_brand or prev_sku) and not mentions_product:
-        steer_bits: List[str] = []
-        if prev_product:
-            steer_bits.append(prev_product)
-            if prev_brand and prev_brand.lower() not in prev_product.lower():
-                steer_bits.append(prev_brand)
-        else:
-            if prev_brand:
-                steer_bits.append(prev_brand)
-            if prev_shade:
-                steer_bits.append(prev_shade)
-        seen = set()
-        steer_bits = [b for b in steer_bits if not (b in seen or seen.add(b))]
-        if steer_bits:
-            product_context = " ".join(steer_bits)
-            if prev_sku:
-                effective_query = f"{product_context} [SKU: {prev_sku}] {user_input}"
-            else:
-                effective_query = f"{product_context} {user_input}"
-            if st.session_state.show_debug:
-                st.info(f"Using previous product context: {product_context}")
+    # Use LLM to reformulate query based on conversation history
+    effective_query = reformulate_query_with_llm(client, user_input, conv_history_for_llm, cfg["model"])
+    
+    # Check if LLM answered directly from history
+    if effective_query.startswith("ANSWER:"):
+        # Extract the direct answer and skip RAG
+        direct_answer = effective_query[7:].strip()
+        if st.session_state.show_debug:
+            st.info("⚡ Answered from conversation history (no RAG)")
+        # Save to history
+        st.session_state.conv_history.append({"role": "user", "content": user_input})
+        append_conv_history(st.session_state.history_path, "user", user_input)
+        st.session_state.conv_history.append({"role": "assistant", "content": direct_answer})
+        append_conv_history(st.session_state.history_path, "assistant", direct_answer)
+        return direct_answer
+    
+    # Check if LLM needs clarification
+    if effective_query.startswith("CLARIFY:"):
+        # Extract the clarification question
+        clarification_msg = effective_query[8:].strip()
+        if st.session_state.show_debug:
+            st.info("❓ Requesting clarification")
+        # Save to history
+        st.session_state.conv_history.append({"role": "user", "content": user_input})
+        append_conv_history(st.session_state.history_path, "user", user_input)
+        st.session_state.conv_history.append({"role": "assistant", "content": clarification_msg})
+        append_conv_history(st.session_state.history_path, "assistant", clarification_msg)
+        return clarification_msg
+    
+    if st.session_state.show_debug:
+        st.info(f"🔄 Query reformulated: '{user_input}' → '{effective_query}'")
 
     # Embeddings + retrieve
+    retrieved_sku = None
+    retrieved_product = None
+    retrieved_brand = None
+    
     if oai and pc_index:
         try:
             vec = embed_query(oai, cfg["embedding_model"], effective_query)
             matches, _ = retrieve_context(pc_index, vec, cfg["pc_namespace"], cfg["pc_top_k"], metadata_filter=None)
-            # Optional rerank by carried SKU or SKU-in-id
-            if matches and last_ref.get("SKU"):
-                prev_sku_val = last_ref.get("SKU")
-                def sku_match_first(item):
-                    md_i = getattr(item, "metadata", None) or item.get("metadata", {})
-                    ident_i = extract_identity_fields(md_i)
-                    id_i = getattr(item, "id", None) or item.get("id")
-                    sku_equal = (ident_i.get("SKU") == prev_sku_val)
-                    id_contains = (isinstance(id_i, str) and prev_sku_val in id_i)
-                    primary = 0 if (sku_equal or id_contains) else 1
-                    score = getattr(item, "score", None)
-                    if score is None and isinstance(item, dict):
-                        score = item.get("score")
-                    secondary = -(score or 0.0)
-                    return (primary, secondary)
-                try:
-                    matches.sort(key=sku_match_first)
-                except Exception:
-                    pass
+            
+            # Extract SKU and product info from top match for context tracking
+            if matches:
+                top_match_md = getattr(matches[0], "metadata", None) or matches[0].get("metadata", {})
+                retrieved_sku = (top_match_md.get("SKU") or top_match_md.get("sku") or 
+                                top_match_md.get("id") or top_match_md.get("product_id") or "").strip()
+                retrieved_product = (top_match_md.get("Product") or top_match_md.get("product") or 
+                                   top_match_md.get("product_name") or top_match_md.get("name") or "").strip()
+                retrieved_brand = (top_match_md.get("Brand") or top_match_md.get("brand") or "").strip()
+                
+                if st.session_state.show_debug and (retrieved_sku or retrieved_product):
+                    st.info(f"📦 Retrieved: {retrieved_product or 'N/A'} | {retrieved_brand or 'N/A'} | SKU: {retrieved_sku or 'N/A'}")
 
             for m in matches:
                 md = getattr(m, "metadata", None) or m.get("metadata", {})
@@ -161,12 +160,6 @@ def do_rag_and_respond(user_input: str) -> str:
                 if txt:
                     context_blocks.append(txt)
 
-            # Update last_ref from top match
-            if matches:
-                top_md = getattr(matches[0], "metadata", None) or matches[0].get("metadata", {})
-                ident = extract_identity_fields(top_md)
-                if ident:
-                    st.session_state.last_ref.update(ident)
         except Exception as e:
             if st.session_state.show_debug:
                 st.warning(f"Retrieval failed: {e}")
@@ -179,10 +172,24 @@ def do_rag_and_respond(user_input: str) -> str:
         "If the answer isn't in the context, say 'I don't know' succinctly."
     )
     question_block = f"Question:\n{user_input}"
+    
+    # Add SKU/product metadata to history for reformulation context
+    product_context_line = ""
+    if retrieved_sku or retrieved_product:
+        context_parts = []
+        if retrieved_product:
+            context_parts.append(f"Product: {retrieved_product}")
+        if retrieved_brand:
+            context_parts.append(f"Brand: {retrieved_brand}")
+        if retrieved_sku:
+            context_parts.append(f"SKU: {retrieved_sku}")
+        if context_parts:
+            product_context_line = f"\n[Retrieved: {', '.join(context_parts)}]"
+    
     if context_text:
-        user_payload = f"{question_block}\n\nContext:\n{context_text}"
+        user_payload = f"{question_block}{product_context_line}\n\nContext:\n{context_text}"
     else:
-        user_payload = f"{question_block}\n\nContext:\n[No relevant context retrieved]"
+        user_payload = f"{question_block}{product_context_line}\n\nContext:\n[No relevant context retrieved]"
 
     # Assemble history window for the LLM from persistent session history
     history_window = load_conv_history(st.session_state.history_path, max_turns)
