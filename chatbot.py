@@ -75,7 +75,7 @@ def load_config():
     pc_env = os.getenv("PINECONE_ENVIRONMENT")
     pc_index_name = os.getenv("PINECONE_INDEX_NAME")
     pc_namespace = os.getenv("PINECONE_NAMESPACE", "default")
-    pc_top_k = int(os.getenv("PINECONE_TOP_K", "3"))
+    pc_top_k = int(os.getenv("PINECONE_TOP_K", "10"))
 
     return {
         "api_key": api_key,
